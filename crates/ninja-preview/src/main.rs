@@ -224,7 +224,10 @@ fn claimable_target(hit: &Hit) -> Option<Target> {
     if bare.is_empty() {
         return None;
     }
-    let resolved = resolve_path(bare, &hit.cwd)?;
+    // 宿主偶发把 OSC-7 / OPEN_URL 的 file:// 原样塞进来；剥成 fs 路径再解析。
+    let bare = file_url_to_fs_path(bare).unwrap_or_else(|| bare.to_string());
+    let cwd = file_url_to_fs_path(&hit.cwd).unwrap_or_else(|| hit.cwd.clone());
+    let resolved = resolve_path(&bare, &cwd)?;
     let meta = std::fs::metadata(&resolved).ok()?;
     if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
         return None;
@@ -263,6 +266,19 @@ fn strip_line_col(s: &str) -> (&str, Option<u32>, Option<u32>) {
         1 => (bare, Some(nums[0]), None),
         _ => (bare, Some(nums[1]), Some(nums[0])), // 后剥的是 line
     }
+}
+
+/// Ghostty OSC-7 / OPEN_URL 偶发 `file://…`：剥成文件系统路径。
+fn file_url_to_fs_path(s: &str) -> Option<String> {
+    let rest = s.strip_prefix("file://")?;
+    let path = if rest.starts_with('/') {
+        rest
+    } else if let Some(slash) = rest.find('/') {
+        &rest[slash..]
+    } else {
+        return None;
+    };
+    Some(path.to_string())
 }
 
 /// 路径解析：`~` 展开（$HOME）；相对路径按 cwd 拼；cwd 空 → 放弃。
@@ -428,6 +444,11 @@ mod tests {
         let t = claimable_target(&hit("ok.rs", dir.to_str().unwrap())).unwrap();
         assert_eq!(t.path, txt);
         assert_eq!(t.line, None);
+
+        // OSC-7 形态的 cwd 也能拼相对路径。
+        let osc = format!("file://localhost{}", dir.display());
+        let t = claimable_target(&hit("ok.rs", &osc)).unwrap();
+        assert_eq!(t.path, txt);
 
         // 二进制 / 不存在 / 相对无 cwd / URL → None。
         let binabs = bin.to_str().unwrap().to_string();
