@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""py-pager — Ninja 插件：⌘+click 路径 → 只读标签页（html 表面）。
+
+第二实现验证（PRODUCT 风险 4）：不依赖 ninja-protocol crate，只按宿主
+文档（docs/cookbook/write-a-plugin.md + crates/ninja-protocol 的 golden
+JSON）手写帧编解码。若文档不自足，这里会先坏。
+
+行为：
+- hit（kind=path，可带 :line:col 后缀，相对路径按 cwd 解析）→
+  文本文件 → hit.claim(50) + layer.open(placement=tab, surface=html)；
+  二进制/超大/不存在 → hit.ignore。
+- layer.ready（id = layer.open 的 id，即 hit.id）→ layer.html（行号页，
+  命中行高亮）。
+- layer.close → 忘掉对应标签。未知 type 忽略不断连；v != 0 退出 78。
+- 只读：不写盘。Esc / ⌘W 关标签由宿主收层；EOF = 正常退出。
+"""
+
+import html
+import json
+import os
+import socket
+import struct
+import sys
+import time
+import urllib.parse
+
+V = 0
+SOCK_ENV = "NINJA_ADE_SOCK"
+CLAIM_PRIORITY = 50
+MAX_FILE_BYTES = 8 * 1024 * 1024
+SNIFF_BYTES = 8192
+
+
+def eprint(*a):
+    print("py-pager:", *a, file=sys.stderr)
+
+
+def send(sock, obj):
+    data = json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    sock.sendall(struct.pack("<I", len(data)) + data)
+
+
+class Decoder:
+    """u32le 长度前缀帧解码（半帧跨读保留）。"""
+
+    def __init__(self):
+        self.buf = b""
+
+    def feed(self, data):
+        self.buf += data
+
+    def pop(self):
+        if len(self.buf) < 4:
+            return None
+        (n,) = struct.unpack("<I", self.buf[:4])
+        if len(self.buf) - 4 < n:
+            return None
+        payload, self.buf = self.buf[4 : 4 + n], self.buf[4 + n :]
+        return payload
+
+
+def strip_file_url(s):
+    if s.startswith("file://"):
+        return urllib.parse.unquote(s[len("file://") :])
+    return s
+
+
+def strip_line_col(s):
+    """`src/a.rs:42:13` → (`src/a.rs`, 42, 13)；无数字后缀原样返回。"""
+    parts = s.split(":")
+    if len(parts) == 1 or not parts[-1].isdigit():
+        return s, None, None
+    if len(parts) >= 3 and parts[-2].isdigit():
+        return ":".join(parts[:-2]), int(parts[-2]), int(parts[-1])
+    return ":".join(parts[:-1]), int(parts[-1]), None
+
+
+def claimable_path(text, cwd):
+    """hit → 可读文本文件路径；不可认领 → None。"""
+    bare, _, _ = strip_line_col(text)
+    bare = strip_file_url(bare)
+    if not bare:
+        return None
+    cwd = strip_file_url(cwd)
+    resolved = bare
+    if not bare.startswith("/") and cwd:
+        cand = os.path.join(cwd, bare)
+        if os.path.isfile(cand):
+            resolved = cand
+    try:
+        st = os.stat(resolved)
+    except OSError:
+        return None
+    if not os.path.isfile(resolved) or st.st_size > MAX_FILE_BYTES:
+        return None
+    try:
+        with open(resolved, "rb") as f:
+            head = f.read(SNIFF_BYTES)
+            if b"\0" in head:
+                return None  # 二进制
+            return resolved
+    except OSError:
+        return None
+
+
+def read_file(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def page_html(path, blob, line):
+    text = blob.decode("utf-8", "replace")
+    rows = []
+    for i, ln in enumerate(text.splitlines() or [""], 1):
+        mark = ' class="cur"' if line == i else ""
+        rows.append(f"<span{mark}>{i:6d}</span>  {html.escape(ln)}")
+    css = (
+        "body{margin:0;background:#1d1f21;color:#c5c8c4}"
+        "pre{margin:0;padding:12px 16px;font:13px/1.55 ui-monospace,Menlo,monospace}"
+        ".cur{background:#3a3d42;color:#fff}"
+    )
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<title>{html.escape(os.path.basename(path) or path)}</title>"
+        f"<style>{css}</style></head><body><pre>"
+        + "\n".join(rows)
+        + "</pre></body></html>"
+    )
+
+
+def main() -> int:
+    sock_path = os.environ.get(SOCK_ENV)
+    if not sock_path:
+        eprint(f"缺 {SOCK_ENV}（应由宿主拉起）")
+        return 2
+    sock = None
+    for _ in range(100):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(sock_path)
+            sock = s
+            break
+        except OSError:
+            try:
+                s.close()
+            except OSError:
+                pass
+            time.sleep(0.05)
+    if sock is None:
+        eprint(f"连不上 {sock_path}")
+        return 2
+    eprint(f"已连接宿主（v{V} pager）")
+
+    dec = Decoder()
+    pending = {}  # layer.open id (= hit id) → path
+    layers = {}  # layer 句柄 → path
+    while True:
+        try:
+            data = sock.recv(65536)
+        except InterruptedError:
+            continue
+        except OSError as e:
+            eprint(f"socket 读失败：{e}")
+            return 2
+        if not data:
+            return 0  # 宿主关 socket（EOF）= 正常退出
+        dec.feed(data)
+        while True:
+            payload = dec.pop()
+            if payload is None:
+                break
+            try:
+                msg = json.loads(payload.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                eprint(f"丢弃无法解码的帧：{e}")
+                continue
+            if msg.get("v") != V:
+                eprint(
+                    f"协议 v{msg.get('v')} 不支持（本实现 v{V}），退出"
+                )
+                return 78
+            t = msg.get("type")
+            if t == "hit":
+                _, line, _ = strip_line_col(msg.get("text", ""))
+                path = claimable_path(msg.get("text", ""), msg.get("cwd", ""))
+                if path is None:
+                    send(sock, {"type": "hit.ignore", "v": V, "id": msg["id"]})
+                    continue
+                eprint(f"claim {path}（行 {line or 1}）")
+                # claim 与 layer.open 背靠背（宿主在汇集窗内异步消化 open）；
+                # layer.open 的 id 复用 hit.id，layer.ready 按它回执配对。
+                send(
+                    sock,
+                    {
+                        "type": "hit.claim",
+                        "v": V,
+                        "id": msg["id"],
+                        "priority": CLAIM_PRIORITY,
+                    },
+                )
+                send(
+                    sock,
+                    {
+                        "type": "layer.open",
+                        "v": V,
+                        "id": msg["id"],
+                        "placement": "tab",
+                        "surface": "html",
+                        "anchor_row": msg.get("row", 0),
+                        "anchor_col": msg.get("col", 0),
+                        "title": os.path.basename(path) or path,
+                    },
+                )
+                pending[msg["id"]] = (path, line)
+            elif t == "layer.ready":
+                ent = pending.pop(msg.get("id"), None)
+                if ent is None:
+                    send(sock, {"type": "layer.close", "v": V, "layer": msg["layer"]})
+                    continue
+                path, line = ent
+                layers[msg["layer"]] = path
+                send(
+                    sock,
+                    {
+                        "type": "layer.html",
+                        "v": V,
+                        "layer": msg["layer"],
+                        "html": page_html(path, read_file(path), line),
+                    },
+                )
+                eprint(f"层 {msg['layer']} 已渲染 {path}")
+            elif t == "layer.close":
+                layers.pop(msg.get("layer"), None)
+            else:
+                pass  # 未知 type：忽略不断连（文档规则）
+
+
+if __name__ == "__main__":
+    sys.exit(main())

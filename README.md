@@ -44,3 +44,17 @@ enabled = ["preview"]
 ```
 
 需要一份已经接线 `pane.snapshot` / `pane.input` 的宿主。完全退出 Ninja 再开。
+
+## py-pager（第二实现验证）
+
+单文件 Python，不依赖 ninja-protocol：只按宿主文档（cookbook + golden JSON）
+手写帧编解码，验证文档自足（PRODUCT 风险 4 的「非官方插件能否只靠文档完成
+文件预览等价物」）。⌘+click 路径 → 只读标签页（html 表面，带行号与命中行
+高亮）；不支持编辑。与 preview 同认领 path 时建议只启用其一（priority 50
+< preview 的 100，两者同开时 preview 胜）。
+
+```sh
+./install-py-pager.sh   # 先跑协议级测试（假宿主驱动全周期），失败不装
+```
+
+需要 python3。代码在 `py-pager/py-pager`，协议测试在 `py-pager/test_pager.py`。
