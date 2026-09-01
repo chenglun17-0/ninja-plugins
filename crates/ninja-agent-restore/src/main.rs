@@ -19,6 +19,14 @@
 mod agent;
 
 use std::collections::{BTreeMap, BTreeSet};
+
+/// 每 pane 的上次观察状态（边沿检测用：pid/cwd/slot 任一变化都重试记录）。
+#[derive(Default)]
+struct PaneSeen {
+    pid: BTreeMap<u32, u32>,
+    cwd: BTreeMap<u32, String>,
+    slot: BTreeMap<u32, String>,
+}
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Instant;
@@ -89,8 +97,7 @@ fn run() -> i32 {
     let mut buf = [0u8; 8192];
     let started = Instant::now();
     let mut saw_panes = false;
-    let mut last_pid: BTreeMap<u32, u32> = BTreeMap::new();
-    let mut last_slot: BTreeMap<u32, String> = BTreeMap::new();
+    let mut seen = PaneSeen::default();
     let mut last_panes: Vec<PaneInfo> = Vec::new();
     loop {
         match stream.read(&mut buf) {
@@ -140,8 +147,7 @@ fn run() -> i32 {
                         &path,
                         &mut pending,
                         &mut saw_panes,
-                        &mut last_pid,
-                        &mut last_slot,
+                        &mut seen,
                         started,
                         &mut stream,
                     );
@@ -168,14 +174,16 @@ fn run() -> i32 {
     }
 }
 
+// run-loop 状态直传（快照+存储+恢复窗+连接）；聚成 ctx 结构只是搬运同
+// 一批字段，不减少耦合。
+#[allow(clippy::too_many_arguments)]
 fn on_snapshot(
     snap: &PaneSnapshot,
     store: &mut Store,
     path: &std::path::Path,
     pending: &mut Vec<(String, String, String)>,
     saw_panes: &mut bool,
-    last_pid: &mut BTreeMap<u32, u32>,
-    last_slot: &mut BTreeMap<u32, String>,
+    seen: &mut PaneSeen,
     started: Instant,
     stream: &mut UnixStream,
 ) {
@@ -191,15 +199,29 @@ fn on_snapshot(
     let mut dirty = false;
     let live_keys: BTreeSet<String> = snap.panes.iter().map(slot_key).collect();
     let live_panes: BTreeSet<u32> = snap.panes.iter().map(|p| p.pane).collect();
-    last_pid.retain(|pane, _| live_panes.contains(pane));
-    last_slot.retain(|pane, _| live_panes.contains(pane));
+    seen.pid.retain(|pane, _| live_panes.contains(pane));
+    seen.cwd.retain(|pane, _| live_panes.contains(pane));
+    seen.slot.retain(|pane, _| live_panes.contains(pane));
 
     for pane in &snap.panes {
+        if std::env::var_os("NINJA_AR_DEBUG").is_some() {
+            eprintln!(
+                "ninja-agent-restore: snap pane={} slot={} fg_pid={} cwd={:?}",
+                pane.pane,
+                slot_key(pane),
+                pane.fg_pid,
+                pane.cwd
+            );
+        }
         let key = slot_key(pane);
-        let prev_slot = last_slot.insert(pane.pane, key.clone());
-        let pid_changed = last_pid.insert(pane.pane, pane.fg_pid) != Some(pane.fg_pid);
+        let prev_slot = seen.slot.insert(pane.pane, key.clone());
+        let pid_changed = seen.pid.insert(pane.pane, pane.fg_pid) != Some(pane.fg_pid);
+        // cwd 迟到（OSC-7/前台 cwd 兜底晚于 fg 切换）也要重试记录：
+        // 边沿只看 pid 会把「fg=agent 但 cwd 还空」的窗永久错过。
+        let cwd_changed = seen.cwd.insert(pane.pane, pane.cwd.clone()).as_deref()
+            != Some(pane.cwd.as_str());
 
-        if !pid_changed {
+        if !pid_changed && !cwd_changed {
             if let Some(old) = prev_slot
                 && old != key
                 && let Some(rec) = store.slots.remove(&old)
