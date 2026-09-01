@@ -1,6 +1,6 @@
 //! 第二语言（Python）只靠文档能解码本协议的帧流。
 //!
-//! 用 Rust 侧编码器把 17 条样例消息（六类）打成帧流写临时文件，再交给
+//! 用 Rust 侧编码器把样例消息（七类）打成帧流写临时文件，再交给
 //! `tests/second_language_decode.py`（纯标准库、纯文档实现）解码，
 //! 输出必须与消息集一致；另证版本门（v=1 → 退出码 78，不猜）。
 //! 无 python3 的环境跳过（macOS 自带）。
@@ -8,7 +8,7 @@
 use std::io::Write;
 use std::process::Command;
 
-use ninja_protocol::{Message, encode_frame};
+use ninja_protocol::{encode_frame, Message};
 
 fn python_probe(py: &std::ffi::OsStr) -> bool {
     Command::new(py)

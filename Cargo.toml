@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/ninja-protocol",
     "crates/ninja-preview",
+    "crates/ninja-agent-restore",
 ]
 
 [workspace.package]
