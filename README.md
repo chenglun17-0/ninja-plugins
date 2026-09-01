@@ -27,6 +27,8 @@ enabled = ["preview"]
 
 记住每个窗口/标签/分屏里正在跑的 CLI agent。关掉 Ninja 再开，宿主先按 `window-save-state` 把窗、标签和工作目录摆回去，本插件再往对应 PTY 打 resume 命令。
 
+已知边缘：**从未发过第一条消息的全新 pi 记录不上**（pi 的 session 文件首条消息才落盘，插件无从拿到 session id）——空会话本也没有可恢复的内容。会话已有对话即可正常记录与恢复。
+
 记录不按秒扫：前台进程/cwd 变了才推快照，退出前再推一次（对照 Orca 的 hook + quit-capture）。
 
 第一步支持：

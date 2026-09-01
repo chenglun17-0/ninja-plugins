@@ -4,7 +4,7 @@
 //! 插件不把 Agent 知识送进协议：宿主只给 pane 槽位 + 前台 pid，本模块
 //! 自己读 argv。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use ninja_protocol::PaneInfo;
@@ -509,18 +509,29 @@ pub fn pane_is_idle_shell(info: &PaneInfo, argv: &[String]) -> bool {
 }
 
 /// 把 pending 槽位对到当前快照：先精确槽位，再唯一 cwd。
+/// slot 精确匹配 → cwd 兜底（排除已认领的 pane）。`claimed` 是本轮恢复
+/// 已经用过/判定过的 pane：布局在退出前后变了（slot 键对不上）而多条
+/// 记录共享同一 cwd 时，逐条认领后剩下的 cwd 命中不再有歧义，也不会把
+/// 第二条 resume 命令打进刚被第一条接管的 pane。
 pub fn match_pane<'a>(
     slot: &str,
     cwd: &str,
     panes: &'a [PaneInfo],
+    claimed: &BTreeSet<u32>,
 ) -> Option<&'a PaneInfo> {
-    if let Some(p) = panes.iter().find(|p| slot_key(p) == slot) {
+    if let Some(p) = panes
+        .iter()
+        .find(|p| slot_key(p) == slot && !claimed.contains(&p.pane))
+    {
         return Some(p);
     }
     if cwd.is_empty() {
         return None;
     }
-    let hits: Vec<&PaneInfo> = panes.iter().filter(|p| p.cwd == cwd).collect();
+    let hits: Vec<&PaneInfo> = panes
+        .iter()
+        .filter(|p| p.cwd == cwd && !claimed.contains(&p.pane))
+        .collect();
     if hits.len() == 1 {
         Some(hits[0])
     } else {
@@ -532,6 +543,7 @@ pub fn match_pane<'a>(
 mod tests {
     use super::*;
     use ninja_protocol::PaneInfo;
+    use std::collections::BTreeSet;
 
     fn rec(argv: &[&str], cwd: &str) -> Option<Recorded> {
         let argv: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
@@ -620,14 +632,39 @@ mod tests {
         let b = PaneInfo::new(2, 0, 1, 0, "/b", 11);
         let panes = [a.clone(), b.clone()];
         assert_eq!(slot_key(&a), "0.0.0");
-        assert_eq!(match_pane("0.1.0", "/b", &panes).unwrap().pane, 2);
-        assert_eq!(match_pane("9.9.9", "/a", &panes).unwrap().pane, 1);
-        assert!(match_pane("9.9.9", "/missing", &panes).is_none());
+        assert_eq!(match_pane("0.1.0", "/b", &panes, &BTreeSet::new()).unwrap().pane, 2);
+        assert_eq!(match_pane("9.9.9", "/a", &panes, &BTreeSet::new()).unwrap().pane, 1);
+        assert!(match_pane("9.9.9", "/missing", &panes, &BTreeSet::new()).is_none());
         let dup = [
             PaneInfo::new(1, 0, 0, 0, "/same", 1),
             PaneInfo::new(2, 0, 1, 0, "/same", 2),
         ];
-        assert!(match_pane("9.9.9", "/same", &dup).is_none());
+        assert!(match_pane("9.9.9", "/same", &dup, &BTreeSet::new()).is_none());
+    }
+
+    #[test]
+    fn same_cwd_records_claim_distinct_panes() {
+        let panes = [
+            PaneInfo::new(1, 0, 0, 0, "/same", 1),
+            PaneInfo::new(2, 0, 1, 0, "/same", 2),
+        ];
+        let mut claimed = BTreeSet::new();
+        let first = match_pane("0.0.0", "/same", &panes, &claimed).unwrap();
+        claimed.insert(first.pane);
+        let second = match_pane("0.0.1", "/same", &panes, &claimed).unwrap();
+        assert_ne!(first.pane, second.pane, "同 cwd 两条记录应各占一个 pane");
+    }
+
+    #[test]
+    fn claimed_slot_pane_falls_back_to_cwd() {
+        let panes = [
+            PaneInfo::new(1, 0, 0, 0, "/same", 1),
+            PaneInfo::new(2, 0, 1, 0, "/same", 2),
+        ];
+        let mut claimed = BTreeSet::new();
+        claimed.insert(1);
+        let p = match_pane("0.0.0", "/same", &panes, &claimed).unwrap();
+        assert_eq!(p.pane, 2, "slot 命中的 pane 已被认领 → cwd 兜底应跳过它");
     }
 
     #[test]

@@ -274,9 +274,10 @@ fn retry_pending(
     panes: &[PaneInfo],
     stream: &mut UnixStream,
 ) {
+    let mut claimed = std::collections::BTreeSet::new();
     let mut still = Vec::new();
     for (slot, cwd, command) in pending.drain(..) {
-        match try_inject(stream, panes, &slot, &cwd, &command) {
+        match try_inject(stream, panes, &slot, &cwd, &command, &mut claimed) {
             Inject::Done => {}
             Inject::Wait => still.push((slot, cwd, command)),
         }
@@ -295,10 +296,14 @@ fn try_inject(
     slot: &str,
     cwd: &str,
     command: &str,
+    claimed: &mut std::collections::BTreeSet<u32>,
 ) -> Inject {
-    let Some(pane) = match_pane(slot, cwd, panes) else {
+    let Some(pane) = match_pane(slot, cwd, panes, claimed) else {
         return Inject::Wait;
     };
+    // 匹配即认领（无论随后是注入还是「已是该 agent」）：同 cwd 的其他
+    // 记录不会再挑中这个 pane。
+    claimed.insert(pane.pane);
     let argv = proc_argv(pane.fg_pid);
     if !pane_is_idle_shell(pane, &argv) {
         if argv.is_empty() {
