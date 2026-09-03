@@ -22,10 +22,10 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use ninja_protocol::frame::{encode_frame, FrameDecoder};
+use ninja_protocol::frame::{FrameDecoder, encode_frame};
 use ninja_protocol::{
     DecodeError, Hit, HitClaim, HitIgnore, HitKind, LayerClose, LayerHtml, LayerMsg, LayerOpen,
-    LayerReady, Message, Placement, Surface, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    LayerReady, MAX_FRAME_BYTES, Message, PROTOCOL_VERSION, Placement, Surface,
 };
 
 mod editor;
@@ -165,17 +165,11 @@ fn on_hit(st: &mut PluginState, hit: &Hit, stream: &mut UnixStream) -> bool {
                 stream,
                 &Message::HitClaim(HitClaim::new(hit.id, CLAIM_PRIORITY)),
             );
+            // 关过的 html tab 宿主可能没送到 layer.close，buffers 会留僵尸。
+            // 不再 goto 死层：有旧句柄就先 close，再 open 新 tab（行号仍走 pending）。
             if let Some(layer) = layer_for_path(st, &target.path) {
-                let body = format!(
-                    "{}:{}",
-                    target.line.unwrap_or(1),
-                    target.col.unwrap_or(1)
-                );
-                let _ = send(
-                    stream,
-                    &Message::LayerMsg(LayerMsg::new(layer, "goto", body)),
-                );
-                return true;
+                let _ = send(stream, &Message::LayerClose(LayerClose::new(layer)));
+                close_buffer(st, layer);
             }
             let title = target
                 .path
